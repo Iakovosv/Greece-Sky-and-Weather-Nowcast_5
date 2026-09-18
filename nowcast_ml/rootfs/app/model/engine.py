@@ -292,10 +292,18 @@ class ModelEngine:
     def infer(self, buffer: Any) -> Dict[str, float]:
         last = buffer.last() if hasattr(buffer, "last") else None
         if not last:
-            return (
+            # Cold start: no reading has been stored yet, so every output is
+            # reported as no-signal. The alert and lead keys are included so
+            # consumers see the same schema from the first message onward.
+            out: Dict[str, float] = (
                 {f"pop_{h}m": 0.0 for h in HORIZONS}
                 | {f"p{p}_{h}m": 0.0 for h in HORIZONS for p in (10, 50, 90)}
+                | {f"alert_{h}m": 0 for h in HORIZONS}
             )
+            out["alert"] = 0
+            out["lead_min"] = 0
+            out["stale"] = 0
+            return out
 
         x = self.base.featurize(last)
         out: Dict[str, float] = {}

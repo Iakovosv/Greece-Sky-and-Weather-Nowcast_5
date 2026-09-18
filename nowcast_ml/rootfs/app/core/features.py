@@ -8,6 +8,7 @@ All lookbacks are taken from the ring buffer by minute offset, not by raw
 index, so the window names match the data they actually contain.
 """
 import math
+from datetime import datetime
 from typing import Any, Dict, List
 
 # Typical magnitudes used to bring deltas onto a comparable scale.
@@ -16,6 +17,19 @@ H_TYP = 10.0   # %
 T_TYP = 2.0    # C
 W_TYP = 5.0    # m/s
 S_TYP = 200.0  # W/m2
+
+# How far a row may sit from the requested lookback and still count. Without a
+# tolerance a dropout would make "10 minutes ago" silently mean "40 minutes ago".
+LOOKBACK_TOLERANCE_MIN = 3.0
+
+
+def _parse_ts(value: Any):
+    if value is None:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except Exception:
+        return None
 
 
 def _f(d: Dict[str, Any], key: str, default: float = 0.0) -> float:
@@ -30,14 +44,37 @@ def _f(d: Dict[str, Any], key: str, default: float = 0.0) -> float:
 
 
 def _row_at(buffer_recent: List[Dict[str, Any]], minutes_ago: int) -> Dict[str, Any] | None:
-    """Row `minutes_ago` minutes before the end of buffer_recent (1 row/minute).
+    """Row approximately `minutes_ago` minutes before the end of buffer_recent.
 
-    buffer_recent[-1] is the current minute, so minutes_ago=1 is the previous
-    row and minutes_ago=10 is ten rows back.
+    Rows are one poll apart, so a row offset normally equals the same number of
+    minutes. When the timestamps show a minute-scale cadence the span is
+    verified, and a row that does not actually cover the requested window is
+    rejected, so a "10m" delta is never silently a 40m change measured across a
+    gap. When the timestamps are not on a minute cadence the row offset is
+    trusted.
     """
-    if minutes_ago <= 0 or len(buffer_recent) < minutes_ago + 1:
+    if minutes_ago <= 0 or len(buffer_recent) < 2:
         return None
-    return buffer_recent[-(minutes_ago + 1)]
+
+    need = minutes_ago + 1
+    if len(buffer_recent) < need:
+        return None
+    candidate = buffer_recent[-need]
+
+    prev_ts = _parse_ts(buffer_recent[-2].get("ts"))
+    cur_ts = _parse_ts(buffer_recent[-1].get("ts"))
+    cand_ts = _parse_ts(candidate.get("ts"))
+    if prev_ts is None or cur_ts is None or cand_ts is None:
+        return candidate
+
+    cadence_min = (cur_ts - prev_ts).total_seconds() / 60.0
+    if not (0.5 <= cadence_min <= 2.0):
+        return candidate
+
+    span_min = (cur_ts - cand_ts).total_seconds() / 60.0
+    if abs(span_min - minutes_ago) > max(LOOKBACK_TOLERANCE_MIN, minutes_ago * 0.5):
+        return None
+    return candidate
 
 
 def _delta(current: Dict[str, Any], buffer_recent: List[Dict[str, Any]],

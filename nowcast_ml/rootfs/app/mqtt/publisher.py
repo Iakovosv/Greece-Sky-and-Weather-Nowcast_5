@@ -128,6 +128,10 @@ class MqttPublisher:
             add_sensor(f"p50_{h}m", f"Nowcast Rain P50 {h}m", "mm", "mdi:water")
             add_sensor(f"p90_{h}m", f"Nowcast Rain P90 {h}m", "mm", "mdi:water")
 
+        # alert and lead time
+        add_sensor("lead_min", "Nowcast Lead Time", "min", "mdi:timer-outline")
+        add_sensor("alert", "Nowcast Rain Alert", "", "mdi:alert")
+
         # status sensor with attributes
         status_object = "nowcast_status"
         status_cfg = {

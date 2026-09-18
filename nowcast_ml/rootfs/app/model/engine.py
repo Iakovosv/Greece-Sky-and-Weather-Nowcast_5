@@ -10,6 +10,9 @@ from ml.persistence import load_state, atomic_save
 
 HORIZONS = (30, 60, 120, 360)
 
+# PoP above which an alert is raised and a lead time is reported.
+ALERT_POP = 0.5
+
 # Leading-indicator features produced by core/features.py that are not already
 # part of the base feature vector. They are already scaled to roughly unit
 # magnitude, so mean=0 / std=1 normalization is correct for them.
@@ -316,6 +319,16 @@ class ModelEngine:
             out[f"p10_{h}m"] = round(q10 * g, 3)
             out[f"p50_{h}m"] = round(q50 * g, 3)
             out[f"p90_{h}m"] = round(q90 * g, 3)
+
+        # Alert flags and the lead time the user actually asked for. The lead
+        # time is the shortest horizon whose PoP has crossed the alert
+        # threshold, i.e. how much warning the current reading gives.
+        for h in HORIZONS:
+            fired = pops[h] >= ALERT_POP
+            out[f"alert_{h}m"] = 1 if fired else 0
+        fired_horizons = [h for h in HORIZONS if pops[h] >= ALERT_POP]
+        out["alert"] = 1 if fired_horizons else 0
+        out["lead_min"] = min(fired_horizons) if fired_horizons else 0
 
         return out
 

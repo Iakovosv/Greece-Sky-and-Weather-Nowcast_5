@@ -169,7 +169,7 @@ The system provides debug logs to help you understand how the model interprets t
 Data Storage & Hardware
 Memory Architecture
 
-Weather observations are stored in RAM (~420 minutes) to avoid constant disk writes.
+Weather observations are stored in RAM (~900 minutes (15 hours)) to avoid constant disk writes.
 
 Disk Protection
 

@@ -192,7 +192,7 @@ Training is cumulative and improves with additional rainfall observations.
 
 # Memory Management
 
-Weather observations are stored in memory for approximately **420 minutes**.
+Weather observations are stored in memory for approximately **900 minutes (15 hours)**.
 
 This window allows the system to analyze atmospheric trends over several hours while keeping resource usage low.
 

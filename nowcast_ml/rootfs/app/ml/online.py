@@ -82,9 +82,25 @@ def apply_training(
     pos_weight: float = 12.0,
     epochs: int = 40,
     trainable: np.ndarray | None = None,
+    max_trainable_weight: float = 6.0,
 ) -> Dict[str, Any]:
     """batch[h] = {'X': [x...], 'amt': [mm...], 'pop': [0/1...]} with x already normalized"""
     info: Dict[str, Any] = {"updated": 0, "by_horizon": {}}
+
+    def _cap(w: np.ndarray) -> np.ndarray:
+        # The trainable coordinates are the locally-adapted pre-rain
+        # indicators. l2 keeps them from running away, but with the same batch
+        # replayed across consecutive runs the norm still creeps upward. A hard
+        # cap guarantees the weights can neither explode nor stay unbounded over
+        # a long-running process.
+        if trainable is None:
+            return w
+        excess = np.abs(w) > max_trainable_weight
+        if excess.any():
+            w = w.copy()
+            w[excess] = np.sign(w[excess]) * max_trainable_weight
+        return w
+
     for h, data in batch.items():
         X = np.asarray(data["X"], dtype=float)
         if X.size == 0:
@@ -106,6 +122,7 @@ def apply_training(
                 w, b, X, y_pop, lr=lr_pop, l2=l2,
                 sample_weight=sample_weight, trainable=trainable,
             )
+            w = _cap(w)
         state.pop[h] = (w, b)
 
         # Quantiles on log1p
@@ -115,7 +132,10 @@ def apply_training(
                 continue
             wq, bq = state.q[h][q]
             for _ in range(max(1, epochs)):
-                wq, bq = sgd_quantile_step(wq, bq, X, y_log, q=q, lr=lr_q, l2=l2)
+                wq, bq = sgd_quantile_step(
+                    wq, bq, X, y_log, q=q, lr=lr_q, l2=l2,
+                    trainable=trainable,
+                )
             state.q[h][q] = (wq, bq)
 
         state.trained_samples += int(len(y_pop))

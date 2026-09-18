@@ -1,0 +1,11 @@
+# Runtime dependencies of the nowcast add-on.
+#
+# The add-on itself installs these through apk (see nowcast_ml/Dockerfile).
+# This file exists so the app can also be run and tested outside Home Assistant
+# with a plain `pip install -r requirements.txt`.
+#
+# Versions are the lower bounds known to work; upper bounds are intentionally
+# open because Home Assistant OS ships frozen apk packages, not pip wheels.
+numpy>=1.24,<3
+paho-mqtt>=1.6,<3
+requests>=2.28,<3

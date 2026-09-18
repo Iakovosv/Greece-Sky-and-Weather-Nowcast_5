@@ -13,6 +13,14 @@ from core.features import compute_derived_features
 from model.engine import ModelEngine
 from mqtt.publisher import MqttPublisher
 
+# A reading is treated as stale once this many minutes have passed without a
+# fresh one. Beyond this the trend features describe an outage, not the weather.
+STALE_AFTER_MIN = 30
+# A pressure move of this size inside the delta window is not weather; it is a
+# sensor fault, and is rejected instead of being fed to the model.
+DP_FAULT_HPA = 12.0
+DP_FAULT_WINDOW_MIN = 10
+
 
 def _to_float(x, default=None):
     try:
@@ -21,6 +29,15 @@ def _to_float(x, default=None):
         return float(x)
     except Exception:
         return default
+
+
+def _parse_ts(value):
+    if value is None:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except Exception:
+        return None
 
 
 def _compute_vpd_kpa(temp_c: float, rh_pct: float) -> float:
@@ -34,7 +51,10 @@ def _compute_dewpoint_c(temp_c: float, rh_pct: float) -> float:
     b = 237.7
     rh = max(1e-6, min(100.0, rh_pct))
     gamma = (a * temp_c) / (b + temp_c) + math.log(rh / 100.0)
-    td = (b * gamma) / (a - gamma)
+    denom = a - gamma
+    if abs(denom) < 1e-9:
+        return temp_c
+    td = (b * gamma) / denom
     if not math.isfinite(td):
         return temp_c
     return td
@@ -65,6 +85,105 @@ def _is_day(row: dict) -> float:
 
     h = datetime.utcnow().hour
     return 1.0 if 6 <= h <= 18 else 0.0
+
+
+def _last_good(buffer, key):
+    """Most recent non-missing value of `key`, or None if there is none."""
+    for row in reversed(buffer.get_all()):
+        v = _to_float(row.get(key), None)
+        if v is not None:
+            return v
+    return None
+
+
+def _forward_fill(value, key, buffer):
+    """Hold the last known reading when a sensor reports nothing this minute.
+
+    Substituting 0.0 for a missing reading makes the model see a simultaneous
+    1013 hPa pressure collapse and a bone-dry atmosphere, which is why a single
+    dropped packet used to drive PoP to 100%. Holding the previous value keeps
+    every derived delta at zero, i.e. "no new information", which is the honest
+    interpretation of a missing sample.
+    """
+    if value is not None:
+        return value
+    return _last_good(buffer, key)
+
+
+def _reject_spike(value, key, buffer, log, max_jump, label):
+    """Discard a one-minute jump too large to be weather.
+
+    Pressure moves a few hPa per half hour and humidity tens of points at a
+    gust front, so a step far larger than that inside a single sample is an
+    instrument fault. Holding the previous value leaves the trend features flat
+    instead of presenting the model with a step change it reads as a storm.
+    """
+    if value is None:
+        return value
+    last = buffer.last()
+    # Compare against the last accepted reading, not the raw one: after a spike
+    # is rejected the next (good) sample would otherwise look like a second
+    # spike in the opposite direction and be rejected too, producing a false
+    # jump in the trend features.
+    prev = _to_float(last.get(key), None) if isinstance(last, dict) else None
+    if prev is None or abs(value - prev) <= max_jump:
+        return value
+    log.warning(
+        f"{label} jump {prev:g} -> {value:g} in one sample exceeds {max_jump:g}; "
+        f"holding previous value (suspect sensor)"
+    )
+    return prev
+
+
+def _median3(buffer, key, current):
+    """Median of the two previous *raw* readings plus the current one.
+
+    A single bad sample is the most common real-world sensor failure, and a jump
+    threshold cannot catch it: 55% -> 100% -> 55% humidity is only a 45 point
+    step, well inside the range a real gust front can produce, yet on its own it
+    makes the trend features look like a saturated airmass and drove PoP to 97%.
+    The median removes an isolated outlier of any size without a per-sensor
+    constant, and lags a genuine ramp by only one sample.
+
+    The baseline is read from the raw readings recorded alongside each row.
+    Reading the filtered value back instead would make the filter recursive and
+    it would latch onto the first filtered sample, freezing every later reading.
+    """
+    if current is None:
+        return None
+    prev = []
+    for row in buffer.last_n(2):
+        v = _to_float(row.get(f"_raw_{key}"), None)
+        if v is None:
+            v = _to_float(row.get(key), None)
+        if v is not None:
+            prev.append(v)
+    if not prev:
+        return current
+    vals = prev + [current]
+    vals.sort()
+    return vals[len(vals) // 2]
+
+
+def _is_stale(buffer, last_ok) -> bool:
+    """True when the current row follows a polling outage.
+
+    During an outage no rows are stored, so the first row after it sits a long
+    time after its predecessor. Its trend features would compare fresh air with
+    pre-outage air, which the model cannot tell apart from a sharp weather
+    change, so the forecast is held until a full window of fresh rows exists.
+
+    Note that a sensor that keeps answering with null values does not trip this:
+    those rows are added continuously and are handled by the forward fill.
+    """
+    rows = buffer.get_all()
+    if len(rows) < 2:
+        return False
+    prev_ts = _parse_ts(rows[-2].get("ts"))
+    cur_ts = _parse_ts(rows[-1].get("ts"))
+    if prev_ts is None or cur_ts is None:
+        return False
+    return (cur_ts - prev_ts).total_seconds() > STALE_AFTER_MIN * 60
 
 
 def run():
@@ -102,6 +221,7 @@ def run():
     ticks = 0
     last_ok = None
     last_daily_save_day = None
+    last_forecast = None
 
     last_debug_emit = 0.0
     debug_features_payload = {}
@@ -145,17 +265,51 @@ def run():
         solar_wm2 = _to_float(parsed.get("solar_wm2"), None)
         lux_klux = _to_float(parsed.get("lux_klux"), None)
 
-        solar_val = 0.0
-        if solar_wm2 is not None:
-            solar_val = float(solar_wm2)
-        elif lux_klux is not None:
-            solar_val = float(lux_klux)
+        # Keep the unfiltered readings so the outlier filters can compare against
+        # what the sensor actually reported rather than their own output.
+        raw_temp, raw_rh = temp_c, rh_pct
+        raw_p_rel, raw_p_abs = p_rel, p_abs
+
+        # Hold the last known reading when a sensor drops out, reject
+        # single-sample jumps that are physically impossible, and take the
+        # median of three so an isolated outlier cannot reach the trend
+        # features, before any of these values are used.
+        temp_c = _median3(
+            buffer, "temperature",
+            _reject_spike(_forward_fill(temp_c, "temperature", buffer),
+                          "temperature", buffer, log, 25.0, "Outdoor temperature"))
+        rh_pct = _median3(
+            buffer, "humidity",
+            _reject_spike(_forward_fill(rh_pct, "humidity", buffer),
+                          "humidity", buffer, log, 70.0, "Outdoor humidity"))
+        if rh_pct is not None:
+            rh_pct = max(0.0, min(100.0, rh_pct))
+        p_rel = _median3(
+            buffer, "pressure",
+            _reject_spike(_forward_fill(p_rel, "pressure", buffer),
+                          "pressure", buffer, log, DP_FAULT_HPA, "Relative pressure"))
+        p_abs = _median3(
+            buffer, "absolutepressure",
+            _reject_spike(_forward_fill(p_abs, "absolutepressure", buffer),
+                          "absolutepressure", buffer, log, DP_FAULT_HPA,
+                          "Absolute pressure"))
+
+        if solar_wm2 is None and lux_klux is None:
+            solar_val = _last_good(buffer, "solarradiation")
+            solar_val = 0.0 if solar_val is None else solar_val
+        else:
+            solar_val = float(solar_wm2) if solar_wm2 is not None else float(lux_klux)
         row["solarradiation"] = solar_val
 
         row["temperature"] = temp_c
         row["humidity"] = rh_pct
         row["pressure"] = p_rel
         row["absolutepressure"] = p_abs
+        row["_raw_temperature"] = raw_temp if raw_temp is not None else temp_c
+        row["_raw_humidity"] = raw_rh if raw_rh is not None else rh_pct
+        row["_raw_pressure"] = raw_p_rel if raw_p_rel is not None else p_rel
+        row["_raw_absolutepressure"] = (
+            raw_p_abs if raw_p_abs is not None else p_abs)
         row["windspeed"] = wspd
         row["windgust"] = wgst
 
@@ -180,8 +334,9 @@ def run():
         row["vpd"] = float(vpd) if vpd is not None else 0.0
 
         # rich features
-        prev10 = buffer.get_minutes_ago(10)
-        prev30 = buffer.get_minutes_ago(30)
+        prev10 = buffer.get_minutes_ago(10, now_ts=last_ok)
+        prev30 = buffer.get_minutes_ago(30, now_ts=last_ok)
+        stale = _is_stale(buffer, last_ok)
 
         def d(key, prev):
             cur = _to_float(row.get(key), None)
@@ -253,6 +408,23 @@ def run():
         # === END ENHANCED FEATURES ===
 
         forecasts = engine.infer(buffer)
+
+        # After an outage the features compare fresh air with pre-outage air,
+        # which the model reads as a sharp weather change. Hold the previous
+        # forecast until a full lookback window of fresh rows exists again,
+        # rather than publishing a reading the data cannot support.
+        if stale:
+            if last_forecast is None:
+                last_forecast = forecasts
+            forecasts = dict(last_forecast)
+            forecasts["stale"] = 1
+            log.warning(
+                "No fresh sensor data for over "
+                f"{STALE_AFTER_MIN}m; holding previous forecast"
+            )
+        else:
+            last_forecast = forecasts
+            forecasts["stale"] = 0
 
         # manual save button
         if publisher and publisher.consume_save_requested():

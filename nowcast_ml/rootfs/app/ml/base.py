@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-BASE_MODEL_PATH = Path("/app/model/base_model.json")
+BASE_MODEL_PATH = Path(os.environ.get("NOWCAST_BASE_MODEL_PATH", "/app/model/base_model.json"))
 
 # clip to keep feature vector stable even if some normalization stats are placeholders
 Z_CLIP = 10.0
